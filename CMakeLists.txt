@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.9)
 project(zipdownloader LANGUAGES CXX)
 
-find_package(Qt5 5.14 REQUIRED COMPONENTS Core Network)
+find_package(Qt5 5.9 REQUIRED COMPONENTS Core Network)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
