@@ -33,8 +33,12 @@ public:
 
     req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
     req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
-    req.setAttribute(QNetworkRequest::SpdyAllowedAttribute, true);
+#if QT_VERSION < QT_VERSION_CHECK(5, 15, 0)
     req.setAttribute(QNetworkRequest::HTTP2AllowedAttribute, true);
+    req.setAttribute(QNetworkRequest::SpdyAllowedAttribute, true);
+#else
+    req.setAttribute(QNetworkRequest::Http2AllowedAttribute, true);
+#endif
 
     get(req);
   }
