@@ -17,7 +17,7 @@ target_compile_features(zipdownloader PRIVATE cxx_std_17)
 include(GenerateExportHeader)
 generate_export_header(zipdownloader)
 
-target_link_libraries(zipdownloader Qt5::Core Qt5::Network)
+target_link_libraries(zipdownloader ${QT_PREFIX}::Core ${QT_PREFIX}::Network)
 set(ZIPDOWNLOADER_EXAMPLES 1)
 if(ZIPDOWNLOADER_EXAMPLES)
   add_executable(zdl_example examples/example.cpp)

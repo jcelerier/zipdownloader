@@ -21,18 +21,30 @@ public:
     connect(this, &QNetworkAccessManager::finished,
             this, [this](QNetworkReply* reply) {
           if(reply->error())
+          {
+              qDebug() << reply->errorString();
               m_error();
+          }
           else
+          {
               m_callback(reply->readAll());
+          }
 
           reply->deleteLater();
           this->deleteLater();
-        });
+    });
 
     QNetworkRequest req{std::move(url)};
+    req.setRawHeader("User-Agent", "curl/7.35.0");
 
-    req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
     req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
+#elif QT_VERSION >= QT_VERSION_CHECK(5, 6, 0)
+    req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
+#endif
+
 #if QT_VERSION < QT_VERSION_CHECK(5, 15, 0)
     req.setAttribute(QNetworkRequest::HTTP2AllowedAttribute, true);
     req.setAttribute(QNetworkRequest::SpdyAllowedAttribute, true);
