@@ -40,7 +40,7 @@ public:
     req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
-    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::SameOriginRedirectPolicy);
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::UserVerifiedRedirectPolicy);
 #elif QT_VERSION >= QT_VERSION_CHECK(5, 6, 0)
     req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
 #endif
@@ -52,7 +52,9 @@ public:
     req.setAttribute(QNetworkRequest::Http2AllowedAttribute, true);
 #endif
 
-    get(req);
+    auto reply = get(req);
+    connect(reply, &QNetworkReply::redirected,
+            reply, &QNetworkReply::redirectAllowed);
   }
 
 private:
