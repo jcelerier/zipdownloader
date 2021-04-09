@@ -169,4 +169,50 @@ void download_and_extract(
     };
 }
 
+std::vector<std::pair<QString, QByteArray>> unzip_all_files_to_memory(const QByteArray& zipFile)
+{
+  std::vector<std::pair<QString, QByteArray>> files;
+
+  mz_zip_archive zip_archive;
+  memset(&zip_archive, 0, sizeof(zip_archive));
+
+  auto status = mz_zip_reader_init_mem(
+        &zip_archive, zipFile.data(), zipFile.size(), 0);
+  if (!status)
+    return files;
+  int fileCount = (int)mz_zip_reader_get_num_files(&zip_archive);
+  if (fileCount == 0)
+  {
+    mz_zip_reader_end(&zip_archive);
+    return files;
+  }
+  mz_zip_archive_file_stat file_stat;
+  if (!mz_zip_reader_file_stat(&zip_archive, 0, &file_stat))
+  {
+    mz_zip_reader_end(&zip_archive);
+    return files;
+  }
+
+  // Get and print information about each file in the archive.
+  for (int i = 0; i < fileCount; i++)
+  {
+    if (!mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
+      continue;
+    if (mz_zip_reader_is_file_a_directory(&zip_archive, i))
+      continue; // skip directories for now
+    if(file_stat.m_uncomp_size > std::numeric_limits<int32_t>::max())
+      continue;
+
+    QByteArray arr{int(file_stat.m_uncomp_size), Qt::Uninitialized};
+    if (mz_zip_reader_extract_to_mem(&zip_archive, i, arr.data(), arr.size(), 0)) {
+      files.emplace_back(QString::fromUtf8(file_stat.m_filename), std::move(arr));
+    }
+  }
+
+  // Close the archive, freeing any resources it was using
+  mz_zip_reader_end(&zip_archive);
+
+  return files;
+}
+
 }

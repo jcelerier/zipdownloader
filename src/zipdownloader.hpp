@@ -1,7 +1,9 @@
 #pragma once
 #include <zipdownloader_export.h>
 #include <QUrl>
+#include <QByteArray>
 #include <functional>
+#include <utility>
 
 namespace zdl
 {
@@ -16,4 +18,7 @@ void download_and_extract(
     const QString& destination,
     const success_callback& success_cb,
     const error_callback& error_cb);
+
+ZIPDOWNLOADER_EXPORT
+std::vector<std::pair<QString, QByteArray>> unzip_all_files_to_memory(const QByteArray& zipFile);
 }
