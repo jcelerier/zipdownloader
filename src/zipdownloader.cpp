@@ -12,13 +12,15 @@ namespace zdl
 {
 namespace
 {
-template <typename OnSuccess, typename OnError>
+template <typename OnSuccess, typename OnProgress, typename OnError>
 class HTTPGet final : public QNetworkAccessManager
 {
 public:
-  explicit HTTPGet(QUrl url, OnSuccess on_success, OnError on_error) noexcept
-      : m_callback{std::move(on_success)}, m_error{std::move(on_error)}
-  {
+  explicit HTTPGet(QUrl url, OnSuccess on_success, OnProgress on_progress, OnError on_error) noexcept
+      : m_callback{std::move(on_success)},
+        m_progress{std::move(on_progress)},
+        m_error{std::move(on_error)}
+{
     connect(this, &QNetworkAccessManager::finished,
             this, [this](QNetworkReply* reply) {
           if(reply->error())
@@ -56,10 +58,13 @@ public:
     auto reply = get(req);
     connect(reply, &QNetworkReply::redirected,
             reply, &QNetworkReply::redirectAllowed);
-  }
+    connect(reply, &QNetworkReply::downloadProgress,
+            this, m_progress);
+}
 
 private:
   OnSuccess m_callback;
+  OnProgress m_progress;
   OnError m_error;
 };
 
@@ -160,11 +165,13 @@ void download_and_extract(
     const QUrl& url,
     const QString& destination,
     const success_callback& success_cb,
+    const progress_callback& progress_cb,
     const error_callback& error_cb)
 {
     new HTTPGet{
         url,
         [=] (const QByteArray& data) { success_cb(unzip(data, destination)); },
+        progress_cb,
         error_cb
     };
 }

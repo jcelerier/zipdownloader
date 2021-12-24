@@ -9,6 +9,7 @@ namespace zdl
 {
 // Argument is the list of extracted files
 using success_callback = std::function<void(std::vector<QString>)>;
+using progress_callback = std::function<void(qint64, qint64)>;
 using error_callback = std::function<void()>;
 
 //! No documentation. Fuck the police.
@@ -17,6 +18,7 @@ void download_and_extract(
     const QUrl& url,
     const QString& destination,
     const success_callback& success_cb,
+    const progress_callback& progress_cb,
     const error_callback& error_cb);
 
 ZIPDOWNLOADER_EXPORT
