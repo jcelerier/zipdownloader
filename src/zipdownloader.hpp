@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <functional>
 #include <utility>
+#include <vector>
 
 namespace zdl
 {
