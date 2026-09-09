@@ -25,8 +25,17 @@ public:
             this, [this](QNetworkReply* reply) {
           if(reply->error())
           {
-              qDebug() << reply->errorString();
-              m_error();
+              // Say what happened: a download that fails two seconds in and
+              // reports nothing leaves the user, and us, with nothing to go on.
+              QString msg = reply->errorString();
+              const auto status
+                  = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+              if(status.isValid())
+                msg += QStringLiteral(" (HTTP %1)").arg(status.toInt());
+              msg += QStringLiteral("\n") + reply->url().toString();
+
+              qDebug() << "zipdownloader:" << msg;
+              m_error(msg);
           }
           else
           {
@@ -38,12 +47,17 @@ public:
     });
 
     QNetworkRequest req{std::move(url)};
-    req.setRawHeader("User-Agent", "curl/7.35.0");
+    // Not "curl/7.35.0": a corporate proxy or a CDN that filters on the agent
+    // turns that into a refusal within seconds, on that machine only.
+    req.setRawHeader("User-Agent", "zipdownloader");
 
     req.setAttribute(QNetworkRequest::HttpPipeliningAllowedAttribute, true);
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
-    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::UserVerifiedRedirectPolicy);
+    // Follow redirects rather than asking to approve each one: a release asset
+    // served from another host redirects on every request, and the approval
+    // has to be connected before the reply can emit it.
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
 #elif QT_VERSION >= QT_VERSION_CHECK(5, 6, 0)
     req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
 #endif
@@ -56,8 +70,6 @@ public:
 #endif
 
     auto reply = get(req);
-    connect(reply, &QNetworkReply::redirected,
-            reply, &QNetworkReply::redirectAllowed);
     connect(reply, &QNetworkReply::downloadProgress,
             this, m_progress);
 }
@@ -170,7 +182,20 @@ void download_and_extract(
 {
     new HTTPGet{
         url,
-        [=] (const QByteArray& data) { success_cb(unzip(data, destination)); },
+        [=] (const QByteArray& data) {
+          auto files = unzip(data, destination);
+          if(files.empty())
+          {
+            // What came back is not a zip we can read: an HTML error page, a
+            // truncated body, an archive we cannot open. Reporting that as a
+            // success with nothing in it is how a download "does nothing".
+            error_cb(QStringLiteral(
+                         "The downloaded archive could not be read (%1 bytes).")
+                         .arg(data.size()));
+            return;
+          }
+          success_cb(std::move(files));
+        },
         progress_cb,
         error_cb
     };
