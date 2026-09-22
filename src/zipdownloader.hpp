@@ -28,4 +28,13 @@ void download_and_extract(
 
 ZIPDOWNLOADER_EXPORT
 std::vector<std::pair<QString, QByteArray>> unzip_all_files_to_memory(const QByteArray& zipFile);
+
+//! Extract every file of the archive under @p destination, at the paths the
+//! archive stores. Returns the files written.
+//!
+//! An archive holding an entry which would land outside @p destination is
+//! refused whole: nothing is written and @p error says which entry it was.
+ZIPDOWNLOADER_EXPORT
+std::vector<QString> unzip_all_files_to_folder(
+    const QByteArray& zipFile, const QString& destination, QString& error);
 }
