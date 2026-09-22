@@ -90,14 +90,33 @@ QString get_path(const QString& str)
   return "";
 }
 
-QString slash_path(const QString& str)
+//! Where an archive entry lands under the destination folder, with the "."
+//! and ".." components resolved.
+//!
+//! False when it would land outside: an absolute path, a Windows drive or UNC
+//! prefix, a backslash separator, or a ".." climbing above the root.
+bool relative_path(const QString& filename, QString& out)
 {
-  return {};
-}
+  if (filename.startsWith('/') || filename.contains('\\'))
+    return false;
+  if (filename.size() > 1 && filename[1] == ':')
+    return false;
 
-QString relative_path(const QString& base, const QString& filename)
-{
-  return filename;
+  QStringList parts;
+  for (const QString& part : filename.split('/', Qt::SkipEmptyParts))
+  {
+    if (part == ".")
+      continue;
+    else if (part != "..")
+      parts.push_back(part);
+    else if (parts.isEmpty())
+      return false;
+    else
+      parts.removeLast();
+  }
+
+  out = parts.join('/');
+  return true;
 }
 
 QString combine_path(const QString& path, const QString& filename)
@@ -111,8 +130,11 @@ bool make_folder(const QString& str)
   return d.mkpath(str);
 }
 
+}
+
 // Mostly based on https://github.com/tessel/miniz/blob/master/example2.c
-std::vector<QString> unzip(const QByteArray& zipFile, const QString& path)
+std::vector<QString> unzip_all_files_to_folder(
+    const QByteArray& zipFile, const QString& path, QString& error)
 {
   std::vector<QString> files;
 
@@ -136,26 +158,43 @@ std::vector<QString> unzip(const QByteArray& zipFile, const QString& path)
     return files;
   }
 
-  // Get root folder
-  QString lastDir = "";
-  QString base
-      = slash_path(get_path(file_stat.m_filename)); // path delim on end
-
-  // Get and print information about each file in the archive.
+  // Every entry is checked before anything is written: a package with one
+  // entry pointing out of the destination is not one to install half of.
+  std::vector<QString> names(fileCount);
   for (int i = 0; i < fileCount; i++)
   {
     if (!mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
       continue;
+
+    const QString name = QString::fromUtf8(file_stat.m_filename);
+    if (!relative_path(name, names[i]))
+    {
+      mz_zip_reader_end(&zip_archive);
+      error = QStringLiteral("The archive holds an entry which would be written "
+                             "outside the destination folder: %1")
+                  .arg(name);
+      return {};
+    }
+  }
+
+  // Get root folder
+  QString lastDir = "";
+
+  // Get and print information about each file in the archive.
+  for (int i = 0; i < fileCount; i++)
+  {
+    const QString& fileName = names[i];
+    if (fileName.isEmpty())
+      continue;
     if (mz_zip_reader_is_file_a_directory(&zip_archive, i))
       continue; // skip directories for now
-    QString fileName
-        = relative_path(base, file_stat.m_filename); // make path relative
     QString destFile = combine_path(path, fileName); // make full dest path
     auto newDir = get_path(fileName);                // get the file's path
     if (newDir != lastDir)
     {
       if (!make_folder(combine_path(path, newDir))) // creates the directory
       {
+        mz_zip_reader_end(&zip_archive);
         return files;
       }
     }
@@ -171,7 +210,6 @@ std::vector<QString> unzip(const QByteArray& zipFile, const QString& path)
 
   return files;
 }
-}
 
 void download_and_extract(
     const QUrl& url,
@@ -183,15 +221,19 @@ void download_and_extract(
     new HTTPGet{
         url,
         [=] (const QByteArray& data) {
-          auto files = unzip(data, destination);
+          QString error;
+          auto files = unzip_all_files_to_folder(data, destination, error);
           if(files.empty())
           {
             // What came back is not a zip we can read: an HTML error page, a
             // truncated body, an archive we cannot open. Reporting that as a
             // success with nothing in it is how a download "does nothing".
-            error_cb(QStringLiteral(
-                         "The downloaded archive could not be read (%1 bytes).")
-                         .arg(data.size()));
+            if(error.isEmpty())
+              error = QStringLiteral(
+                          "The downloaded archive could not be read (%1 bytes).")
+                          .arg(data.size());
+            qDebug() << "zipdownloader:" << error;
+            error_cb(error);
             return;
           }
           success_cb(std::move(files));
