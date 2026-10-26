@@ -2,11 +2,14 @@
 
 #include "miniz.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QPointer>
+#include <QSet>
 #include <QTemporaryFile>
 #include <QUrl>
 #include <QDebug>
@@ -29,7 +32,10 @@ public:
   explicit HTTPGet(
       QUrl url, const QString& destination, OnSuccess on_success,
       OnProgress on_progress, OnError on_error) noexcept
-      : m_callback{std::move(on_success)},
+      // Owned by the application: quitting mid-download destroys us, and the
+      // temporary file with us, instead of leaving a gigabyte behind.
+      : QNetworkAccessManager{QCoreApplication::instance()},
+        m_callback{std::move(on_success)},
         m_progress{std::move(on_progress)},
         m_error{std::move(on_error)}
   {
@@ -105,9 +111,13 @@ public:
     req.setAttribute(QNetworkRequest::SpdyAllowedAttribute, true);
 #else
     req.setAttribute(QNetworkRequest::Http2AllowedAttribute, true);
+    // A connection which stops sending is an error, not a download that never
+    // finishes. This is the time without data, not the length of the download.
+    req.setTransferTimeout(60000);
 #endif
 
     auto reply = get(req);
+    m_reply = reply;
     connect(reply, &QNetworkReply::readyRead, this, [this, reply] {
       if(!m_writeError.isEmpty())
         return;
@@ -118,6 +128,15 @@ public:
     connect(reply, &QNetworkReply::downloadProgress,
             this, m_progress);
 }
+
+  ~HTTPGet() override
+  {
+    // Destroyed with the application mid-download: the replies aborted by the
+    // base destructor must not reach callbacks whose objects may be gone.
+    disconnect(this, nullptr, this, nullptr);
+    if(m_reply)
+      m_reply->disconnect(this);
+  }
 
 private:
   //! Appends to the temporary file; an error message when the disk refuses.
@@ -133,6 +152,7 @@ private:
   OnProgress m_progress;
   OnError m_error;
   QTemporaryFile* m_file{};
+  QPointer<QNetworkReply> m_reply;
   QString m_writeError;
 };
 
@@ -149,8 +169,21 @@ QString get_path(const QString& str)
 //! Where an archive entry lands under the destination folder, with the "."
 //! and ".." components resolved.
 //!
+#if defined(_WIN32)
+//! NUL, COM1, CON.txt...: Windows opens the device, whatever the folder.
+bool is_device_name(const QString& part)
+{
+  const QString base = part.section('.', 0, 0).trimmed().toUpper();
+  if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL")
+    return true;
+  return base.size() == 4 && (base.startsWith("COM") || base.startsWith("LPT"))
+         && base[3] >= '1' && base[3] <= '9';
+}
+#endif
+
 //! False when it would land outside: an absolute path, a Windows drive or UNC
-//! prefix, a backslash separator, or a ".." climbing above the root.
+//! prefix, a backslash separator, or a ".." climbing above the root. On Windows
+//! also a ':' (NTFS reads "name:stream" as a stream of "name") or a device name.
 bool relative_path(const QString& filename, QString& out)
 {
   if (filename.startsWith('/') || filename.contains('\\'))
@@ -161,6 +194,10 @@ bool relative_path(const QString& filename, QString& out)
   QStringList parts;
   for (const QString& part : filename.split('/', Qt::SkipEmptyParts))
   {
+#if defined(_WIN32)
+    if (part.contains(':') || is_device_name(part))
+      return false;
+#endif
     if (part == ".")
       continue;
     else if (part != "..")
@@ -206,16 +243,15 @@ mz_uint32 unix_mode(const mz_zip_archive_file_stat& stat)
 
 //! The permission bits of @p mode as Qt permissions. The owner keeps read and
 //! write whatever the archive says, so that the package can be updated or
-//! uninstalled later.
+//! uninstalled later. Nobody else gets to write: a library another user can
+//! replace is a library they run code in this process with.
 QFileDevice::Permissions to_permissions(mz_uint32 mode)
 {
   QFileDevice::Permissions p = QFileDevice::ReadOwner | QFileDevice::WriteOwner;
   if (mode & 0100) p |= QFileDevice::ExeOwner;
   if (mode & 0040) p |= QFileDevice::ReadGroup;
-  if (mode & 0020) p |= QFileDevice::WriteGroup;
   if (mode & 0010) p |= QFileDevice::ExeGroup;
   if (mode & 0004) p |= QFileDevice::ReadOther;
-  if (mode & 0002) p |= QFileDevice::WriteOther;
   if (mode & 0001) p |= QFileDevice::ExeOther;
   return p;
 }
@@ -226,29 +262,118 @@ struct link_entry
   QString target; // what it points to, relative to the link's folder
 };
 
+//! The names of the archive's links, as compared on a case-insensitive
+//! filesystem too: "Lib" and "lib/x" are the same folder on macOS and Windows.
+using link_set = QSet<QString>;
+
+//! Whether reaching @p path, relative to the destination, goes through one of
+//! the archive's links: the link may point anywhere inside, and what is under it
+//! is then somewhere else than the archive says.
+bool through_link(const QString& path, const link_set& links)
+{
+  for (int i = path.indexOf('/'); i != -1; i = path.indexOf('/', i + 1))
+    if (links.contains(path.left(i).toCaseFolded()))
+      return true;
+  return false;
+}
+
+//! Whether the link at @p path, to @p target, points inside the destination.
+//!
+//! The filesystem resolves a target one component at a time, following links as
+//! it meets them: with "u -> .." in the archive, "u/../../x" climbs from where u
+//! points, not from u's folder. So the target may only name one of the
+//! archive's links as its last component (that link is checked on its own),
+//! never on its way. Then resolving it as text is resolving it as the
+//! filesystem will.
+bool link_inside(const QString& path, const QString& target, const link_set& links)
+{
+  const QString folder = get_path(path);
+  QString resolved;
+  if (target.isEmpty()
+      || !relative_path(folder.isEmpty() ? target : folder + '/' + target, resolved)
+      || resolved.isEmpty())
+    return false;
+
+  QStringList parts = folder.split('/', Qt::SkipEmptyParts);
+  const QStringList steps = target.split('/', Qt::SkipEmptyParts);
+  for (int i = 0; i < steps.size(); i++)
+  {
+    if (steps[i] == ".")
+      continue;
+    if (steps[i] == "..")
+    {
+      parts.removeLast(); // relative_path said it does not climb out
+      continue;
+    }
+    parts.push_back(steps[i]);
+    if (i + 1 < steps.size() && links.contains(parts.join('/').toCaseFolded()))
+      return false;
+  }
+  return true;
+}
+
+//! @p path as the filesystem resolves it now is @p root or under it. @p root
+//! is canonical.
+bool physically_under(const QString& root, const QString& path)
+{
+  const QString canonical = QFileInfo{path}.canonicalFilePath();
+  return !canonical.isEmpty() && (canonical == root || canonical.startsWith(root + '/'));
+}
+
 //! Creates the archive's symbolic links once every file is in place.
 //!
 //! Where links cannot be created (Windows without the privilege), each one is
 //! replaced by a copy of what it points to: the package then holds the same
 //! names, which is what its users look the files up by. Links to links are
 //! copied in the order that resolves them; a link to a folder is not copied.
+//!
+//! What the archive's links point to was checked before anything was written;
+//! where they point once created is checked again against the filesystem, which
+//! is what loading through them will see.
 bool create_links(
     const QString& root, const std::vector<link_entry>& links,
     std::vector<QString>& files, QString& error)
 {
+  const QString canonicalRoot = QFileInfo{root}.canonicalFilePath();
+  auto fail = [&](const QString& message) {
+    error = message;
+    return false;
+  };
+
   std::vector<link_entry> pending;
+  std::vector<QString> created;
   for (const auto& link : links)
   {
     const QString dest = combine_path(root, link.path);
+    // A link may be the only entry of its folder.
+    const QString folder = QFileInfo{dest}.absolutePath();
+    if (!make_folder(folder) || !physically_under(canonicalRoot, folder))
+      return fail(QStringLiteral("Could not create the folder %1").arg(folder));
+
     QFile::remove(dest);
 #if !defined(_WIN32)
     if (::symlink(link.target.toUtf8().constData(), dest.toUtf8().constData()) == 0)
     {
-      files.emplace_back(dest);
+      created.push_back(dest);
       continue;
     }
 #endif
     pending.push_back(link);
+  }
+
+  for (const QString& dest : created)
+  {
+    // Dangling, cyclic or outside: a package is not installed with that in it,
+    // whichever platform it is installed on.
+    if (!physically_under(canonicalRoot, dest))
+    {
+      for (const QString& link : created)
+        QFile::remove(link);
+      return fail(QStringLiteral("The archive holds a link which does not resolve "
+                                 "inside the destination folder: %1")
+                      .arg(QDir{root}.relativeFilePath(dest)));
+    }
+    files.push_back(dest);
   }
 
   for (bool progress = true; progress && !pending.empty();)
@@ -258,9 +383,17 @@ bool create_links(
     {
       const QString dest = combine_path(root, it->path);
       const QString source = combine_path(QFileInfo{dest}.absolutePath(), it->target);
-      if (QFileInfo{source}.isFile() && QFile::copy(source, dest))
+      const QFileInfo info{source};
+      if (info.isDir() && physically_under(canonicalRoot, source))
       {
-        files.emplace_back(dest);
+        qDebug() << "zipdownloader: not copying the link to a folder" << it->path;
+        it = pending.erase(it);
+        progress = true;
+      }
+      else if (info.isFile() && physically_under(canonicalRoot, source)
+               && QFile::copy(source, dest))
+      {
+        files.push_back(dest);
         it = pending.erase(it);
         progress = true;
       }
@@ -274,11 +407,8 @@ bool create_links(
   for (const auto& link : pending)
     qDebug() << "zipdownloader: could not create" << link.path << "->" << link.target;
   if (!pending.empty())
-  {
-    error = QStringLiteral("Could not create the link %1 -> %2")
-                .arg(pending.front().path, pending.front().target);
-    return false;
-  }
+    return fail(QStringLiteral("Could not create the link %1 -> %2")
+                    .arg(pending.front().path, pending.front().target));
   return true;
 }
 
@@ -298,6 +428,7 @@ std::vector<QString> extract_all(mz_zip_archive& zip_archive, const QString& pat
   std::vector<QString> names(fileCount);
   std::vector<mz_uint32> modes(fileCount);
   std::vector<link_entry> links;
+  link_set link_names;
   for (int i = 0; i < fileCount; i++)
   {
     mz_zip_archive_file_stat file_stat;
@@ -327,21 +458,36 @@ std::vector<QString> extract_all(mz_zip_archive& zip_archive, const QString& pat
       return {};
     }
 
-    const QString link_target
-        = QString::fromUtf8(target, (int)file_stat.m_uncomp_size);
-    const QString folder = get_path(names[i]);
-    QString resolved;
-    if (link_target.isEmpty()
-        || !relative_path(folder.isEmpty() ? link_target : folder + '/' + link_target, resolved)
-        || resolved.isEmpty())
+    links.push_back({names[i], QString::fromUtf8(target, (int)file_stat.m_uncomp_size)});
+    link_names.insert(names[i].toCaseFolded());
+  }
+
+  for (int i = 0; i < fileCount; i++)
+  {
+    if (through_link(names[i], link_names))
+    {
+      error = QStringLiteral("The archive holds an entry under one of its links: %1")
+                  .arg(names[i]);
+      return {};
+    }
+  }
+  for (const auto& link : links)
+  {
+    if (!link_inside(link.path, link.target, link_names))
     {
       error = QStringLiteral("The archive holds a link which points outside the "
                              "destination folder: %1 -> %2")
-                  .arg(name, link_target);
+                  .arg(link.path, link.target);
       return {};
     }
-    links.push_back({names[i], link_target});
   }
+
+  if (!make_folder(path))
+  {
+    error = QStringLiteral("Could not create the folder %1").arg(path);
+    return {};
+  }
+  const QString canonicalRoot = QFileInfo{path}.canonicalFilePath();
 
   QString lastDir;
   for (int i = 0; i < fileCount; i++)
@@ -358,13 +504,20 @@ std::vector<QString> extract_all(mz_zip_archive& zip_archive, const QString& pat
     auto newDir = get_path(fileName);                // get the file's path
     if (newDir != lastDir)
     {
-      if (!make_folder(combine_path(path, newDir))) // creates the directory
+      // The archive cannot lead out of the destination; a destination which is
+      // not empty can, with links of its own.
+      const QString dir = combine_path(path, newDir);
+      if (!make_folder(dir) || !physically_under(canonicalRoot, dir))
       {
-        error = QStringLiteral("Could not create the folder %1").arg(combine_path(path, newDir));
+        error = QStringLiteral("Could not create the folder %1").arg(dir);
         return {};
       }
       lastDir = newDir;
     }
+
+    // Replaced, not written through.
+    if (QFileInfo{destFile}.isSymLink())
+      QFile::remove(destFile);
 
     // A file that does not make it out (a full disk, typically) fails the whole
     // extraction: a package missing some of its files is not an installed package.
