@@ -3,6 +3,7 @@
 #include "miniz.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -77,8 +78,15 @@ public:
 
           if(msg.isEmpty())
           {
-              m_file->close();
-              m_callback(m_file->fileName());
+              // Released before it is handed on, not just closed: on Windows a
+              // closed QTemporaryFile keeps its handle, and miniz opens the
+              // archive with _wfopen_s, which refuses to share it with a writer.
+              const QString fileName = m_file->fileName();
+              m_file->setAutoRemove(false);
+              delete m_file;
+              m_file = nullptr;
+              m_callback(fileName);
+              QFile::remove(fileName);
           }
           else
           {
@@ -412,6 +420,16 @@ bool create_links(
   return true;
 }
 
+//! miniz's write callback, appending to the open QFile @p opaque. miniz writes
+//! each entry in order; anything else is reported as a failed write.
+size_t write_to_file(void* opaque, mz_uint64 offset, const void* data, size_t size)
+{
+  auto& file = *static_cast<QFile*>(opaque);
+  if (file.pos() != (qint64)offset)
+    return 0;
+  return file.write(static_cast<const char*>(data), (qint64)size) == (qint64)size ? size : 0;
+}
+
 //! Extracts every entry of an initialized archive under @p path: regular files
 //! with the permissions a Unix archive records, then symbolic links.
 std::vector<QString> extract_all(mz_zip_archive& zip_archive, const QString& path, QString& error)
@@ -521,13 +539,30 @@ std::vector<QString> extract_all(mz_zip_archive& zip_archive, const QString& pat
 
     // A file that does not make it out (a full disk, typically) fails the whole
     // extraction: a package missing some of its files is not an installed package.
-    if (!mz_zip_reader_extract_to_file(&zip_archive, i, destFile.toUtf8(), 0))
+    // Written through QFile rather than miniz's own fopen: on Windows only the
+    // former reaches past MAX_PATH, and packages nest deep enough to need it.
+    QFile out{destFile};
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
     {
       error = QStringLiteral("Could not extract %1 to %2: %3")
-                  .arg(fileName, destFile,
-                       QString::fromUtf8(mz_zip_get_error_string(mz_zip_get_last_error(&zip_archive))));
+                  .arg(fileName, destFile, out.errorString());
       return {};
     }
+    if (!mz_zip_reader_extract_to_callback(&zip_archive, i, write_to_file, &out, 0))
+    {
+      const QString reason = out.error() != QFileDevice::NoError
+          ? out.errorString()
+          : QString::fromUtf8(mz_zip_get_error_string(mz_zip_get_last_error(&zip_archive)));
+      error = QStringLiteral("Could not extract %1 to %2: %3")
+                  .arg(fileName, destFile, reason);
+      return {};
+    }
+
+    // What mz_zip_reader_extract_to_file did on top of the bytes.
+    if (mz_zip_archive_file_stat file_stat; mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
+      out.setFileTime(QDateTime::fromSecsSinceEpoch(file_stat.m_time),
+                      QFileDevice::FileModificationTime);
+    out.close();
 
     if (modes[i] & 0777)
       QFile::setPermissions(destFile, to_permissions(modes[i]));
